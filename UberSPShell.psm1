@@ -1,5 +1,5 @@
 # Author: Fırat Akcan
-# E-mail: akcan.firat@gmail.com
+# akcan.firat |at| gmail |dot| com
 # 2019
 
 Import-Module Easy-Peasy
