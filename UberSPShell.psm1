@@ -1,31 +1,70 @@
 # Author: Fırat Akcan
 # akcan.firat |at| gmail |dot| com
-# 2019
+# 2020
 
 Import-Module Easy-Peasy
-Add-PSSnapinIfNotYetAdded Microsoft.SharePoint.PowerShell
+Add-PSSnapin Microsoft.SharePoint.PowerShell
 
 function Add-SharepointShellAdmin {
 	[CmdletBinding()]
 	param(
 		[Parameter(Mandatory = $true,HelpMessage = "Please provide the name of the new Farm Administrator in the form of DOMAIN\Username")]
 		[ValidateNotNullOrEmpty()]
-		[string]$newFarmAdministrator
+		[string]$NewFarmAdministrator
 	)
 	SPLogMe
 	
 	$caWebApp = Get-SPWebApplication -IncludeCentralAdministration | Where-Object { $_.DisplayName -like "*Central Administration*" }
 	$caSite = $caWebApp.Sites[0]
 	$caWeb = $caSite.RootWeb
-
-	$farmAdministrators = $caWeb.SiteGroups["Farm Administrators"]
-	$farmAdministrators.AddUser($newFarmAdministrator, "", $newFarmAdministrator, "Configured via UberSPShell")
+	
+	$caWeb.SiteGroups["Farm Administrators"].AddUser($NewFarmAdministrator, "", $NewFarmAdministrator, "Configured via UberSPShell")	
 
 	$caWeb.Dispose()
 	$caSite.Dispose()
 
-	$caDB = Get-SPContentDatabase -WebApplication $caWebApp
-	Add-SPShellAdmin -Database $caDB -UserName $newFarmAdministrator
+	Get-SPWebApplication | % {
+		$WebAppPolicy = $_.Policies.Add($NewFarmAdministrator, $NewFarmAdministrator)
+		$PolicyRole = $_.PolicyRoles.GetSpecialRole([Microsoft.SharePoint.Administration.SPPolicyRoleType]::FullControl)
+		$WebAppPolicy.PolicyRoleBindings.Add($PolicyRole)
+		
+		$iW_WebAppPolicy = $_.Policies.Add("i:0#.w|" + $NewFarmAdministrator, "i:0#.w|" + $NewFarmAdministrator)
+		$PolicyRole = $_.PolicyRoles.GetSpecialRole([Microsoft.SharePoint.Administration.SPPolicyRoleType]::FullControl)
+		$iW_WebAppPolicy.PolicyRoleBindings.Add($PolicyRole)
+		
+		$_.Update()
+		Write-Host "Added user to $($_.URL)"
+	}
+	 
+	Get-SPDatabase | Add-SPShellAdmin -Username $NewFarmAdministrator
+}
+
+function Remove-SharepointShellAdmin {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true,HelpMessage = "Please provide the name of the new Farm Administrator in the form of DOMAIN\Username")]
+		[ValidateNotNullOrEmpty()]
+		[string]$FarmAdministrator
+	)
+	SPLogMe
+	
+	$caWebApp = Get-SPWebApplication -IncludeCentralAdministration | Where-Object { $_.DisplayName -like "*Central Administration*" }
+	$caSite = $caWebApp.Sites[0]
+	$caWeb = $caSite.RootWeb
+	$spuser = $caWeb.SiteGroups["Farm Administrators"].Users | ? { $_.UserLogin -like ("*"+$FarmAdministrator+"*") }
+	$spuser | % { $caWeb.SiteGroups["Farm Administrators"].RemoveUser($_) }
+
+	$caWeb.Dispose()
+	$caSite.Dispose()
+
+	Get-SPWebApplication | % {
+		$_.Policies.Remove($FarmAdministrator)
+		$_.Policies.Remove("i:0#.w|" + $FarmAdministrator)
+		$_.Update()
+		Write-Host "Removed user from $($_.URL)"
+	}
+	 
+	Get-SPDatabase | Remove-SPShellAdmin -Username $FarmAdministrator
 }
 
 function Enable-SPDeveloperDashboard {
@@ -80,7 +119,9 @@ function Backup-WSPSolutions {
 	param(
 		[Parameter(Mandatory = $false,HelpMessage = "Please provide the path of the backup folder, otherwise default path will be used.")]
 		[ValidateNotNullOrEmpty()]
-		[string]$backupFolder = $env:CustomWspBackupPath
+		[string]$backupFolder = $env:CustomWspBackupPath,
+		[Parameter(Mandatory = $true)]
+		[PSCredential] $Credential
 	)
 	SPLogMe
 	
@@ -88,14 +129,15 @@ function Backup-WSPSolutions {
 	$currentBackupFolder = Join-Path -Path $backupFolder -ChildPath $now
 	
 	$Command = {
-		$currentBackupFolder = {0}
-		New-Item -ItemType Directory -Force -Path $currentBackupFolder -Force
-		Get-SPSolution | ForEach-Object {
-			$_.SolutionFile.SaveAs("$currentBackupFolder\$($_.Name)")
+		$currentBackupFolder = "{0}"
+		$solutions = Get-SPSolution
+		if($solutions.Count -gt 0){
+			New-Item -ItemType Directory -Path $currentBackupFolder -Force
+			$solutions | % { $_.SolutionFile.SaveAs("$currentBackupFolder\$($_.Name)") }
 		}
-	}
-	$cmd = Replace-ScriptBlockWithArguments -Command $Command -Arguments $currentBackupFolder	
-	DoParallel-OnSPServers -Command $cmd
+	}	
+	$cmd = Fill-ScriptBlockWithArguments -Command $Command -Arguments $currentBackupFolder	
+	Do-ParallelOnSPServers -Command $cmd -Credential $Credential
 	
 	return $currentBackupFolder
 }
@@ -105,11 +147,13 @@ function Backup-SPWebConfig {
 	param(
 		[Parameter(Mandatory = $false,HelpMessage = "Please provide the path of the backup folder, otherwise default path will be used.")]
 		[ValidateNotNullOrEmpty()]
-		[string]$backupFolder = $env:CustomWebconfigBackupPath
+		[string]$backupFolder = $env:CustomWebconfigBackupPath,
+		[Parameter(Mandatory = $true)]
+		[PSCredential] $Credential
 	)
 	SPLogMe
 	
-	DoParallel-OnSPServers -Command {
+	Do-ParallelOnSPServers -Credential $Credential -Command {
 		Get-SPWebApplication | % {
 			$zone = $_.AlternateUrls[0].UrlZone
 			$iisSettings = $_.IISSettings[$zone]
@@ -374,26 +418,34 @@ function Get-SPServersOn {
 		[string] $Server,
 		[Parameter(Mandatory = $false)]
 		[ValidateNotNullOrEmpty()]
-		[PSCredential] $Credential
+		[PSCredential] $Credential,
+		[Parameter(Mandatory = $false)]
+		[switch]$UseCredSspAuthentication
 	)
 	SPLogMe
 	
+	$scriptBlock = { 
+		Add-PsSnapin Microsoft.Sharepoint.Powershell
+		Get-SPServer | ? { $_.Role -ne "Invalid" } | % { $_.Address } 
+	}
+	
 	if($Credential -eq $null) {
-		return (Invoke-Command -ComputerName $Server -ScriptBlock { 
-			Get-SPServer | ? { $_.Role -eq "Application" } | % { $_.Address } 
-		} )
+		return (Invoke-Command -ComputerName $Server -ScriptBlock $scriptBlock )
 	}
 	else {
-		return (Invoke-Command -Credential $Credential -ComputerName $Server -ScriptBlock { 
-			Get-SPServer | ? { $_.Role -eq "Application" } | % { $_.Address } 
-		} )
+		if($UseCredSspAuthentication.IsPresent) {
+			return (Invoke-Command -Credential $Credential -ComputerName $Server -ScriptBlock $scriptBlock -Authentication CredSsp )
+		}
+		else {
+			return (Invoke-Command -Credential $Credential -ComputerName $Server -ScriptBlock $scriptBlock )
+		}
 	}
 }
 
 function Get-SPServers {
 	SPLogMe
 	
-	return (Get-SPServer | ? { $_.Role -eq "Application" } | % { $_.Address })
+	return (Get-SPServer | ? { $_.Role -ne "Invalid" } | % { $_.Address })
 }
 
 function Get-SPDistributedCacheServersStatus {
@@ -406,7 +458,7 @@ function Get-SPDistributedCacheServersStatus {
 	)
 	SPLogMe
 	
-	[array]$servers = Get-SPServer | ? {($_.ServiceInstances | % TypeName) -contains 'Distributed Cache'} | % { $_.Address }
+	[array]$servers = Get-SPDistributedCacheServers
 	$scriptBlock = {
 		Add-PSSnapin Microsoft.SharePoint.PowerShell
 		Get-SPServiceInstance | Where-Object { ($_.Service.ToString()) -eq "SPDistributedCacheService Name=AppFabricCachingService" } | Select-Object Server,Status
@@ -416,10 +468,10 @@ function Get-SPDistributedCacheServersStatus {
 	switch ($NodeByNode.IsPresent) {
 		$false {
 			if($Credential -eq $null) {
-				return (DoParallel-OnSPServers -Servers $servers -Command $scriptBlock)
+				return (Do-ParallelOnSPServers -Servers $servers -Command $scriptBlock)
 			}
 			else {
-				return (DoParallel-OnSPServers -Servers $servers -Credential $Credential -Command $scriptBlock)
+				return (Do-ParallelOnSPServers -Servers $servers -Credential $Credential -Command $scriptBlock)
 			}
 		}
 		$true {			
@@ -499,12 +551,12 @@ function Get-SPServersNeedsUpgrade {
 function Start-SPWindowsServices {
 	SPLogMe
 	
-	$SPservices = @("SPAdminV4", "SPTimerV4", "SPTraceV4", "SPUserCodV4", "SPWriterV4", "OSearch15", "W3SVC")
+	$SPservices = @("SPAdminV4", "SPTimerV4", "SPTraceV4", "SPUserCodV4", "SPWriterV4", "OSearch1*", "SPSearchHostController", "W3SVC")
 
 	foreach ($service in $SPservices)
 	{
-		Write-Host -ForegroundColor green "Starting $STservices ..."
-		Start-Service -Name $service
+		Write-Host -ForegroundColor green "Starting $service ..."
+		Get-Service | ? { $_.Name -like $service -and $_.StartType -ne "Disabled" } | % { Start-Service -Name $_.Name }
 	}
 	iisreset /start
 }
@@ -512,13 +564,13 @@ function Start-SPWindowsServices {
 function Stop-SPWindowsServices {
 	SPLogMe
 	
-	$SPservices = @("W3SVC", "SPTimerV4", "SPTraceV4", "SPUserCodV4", "SPWriterV4", "OSearch15", "SPAdminV4")
+	$SPservices = @("W3SVC", "SPTimerV4", "SPTraceV4", "SPUserCodV4", "SPWriterV4", "OSearch1*", "SPSearchHostController", "SPAdminV4")
 
 	iisreset /stop
 	foreach ($service in $SPservices)
 	{
-		Write-Host -ForegroundColor Red "Stopping $STservices ..."
-		Stop-Service -Name $service
+		Write-Host -ForegroundColor Red "Stopping $service ..."
+		Get-Service | ? { $_.Name -like $service -and $_.Status -eq "Running" } | % { Stop-Service -Name $_.Name }
 	}	
 }
 
@@ -649,14 +701,14 @@ function Reset-AllSPIIS {
 	switch ($NodeByNode.IsPresent) {
 		$false {
 			if($Credential -eq $null) {
-				return (DoParallel-OnSPServers -Command { Start-Process -FilePath "iisreset.exe" -NoNewWindow -Wait })
+				return (Do-ParallelOnSPServers -Command { Start-Process -FilePath "iisreset.exe" -NoNewWindow -Wait })
 			}
 			else {
-				return (DoParallel-OnSPServers -Credential $Credential -Command { Start-Process -FilePath "iisreset.exe" -NoNewWindow -Wait })
+				return (Do-ParallelOnSPServers -Credential $Credential -Command { Start-Process -FilePath "iisreset.exe" -NoNewWindow -Wait })
 			}
 		}
 		$true {
-			[array]$servers = Get-SPServer | ? { $_.Role -eq "Application" } | % { $_.Address }
+			[array]$servers = Get-SPServer | ? { $_.Role -ne "Invalid" } | % { $_.Address }
 			[array]$result = @()
 			$servers | % {
 				if($Credential -ne $null) {
@@ -672,67 +724,37 @@ function Reset-AllSPIIS {
 	}	
 }
 
-function DoParallel-OnSPServers {
+function Do-ParallelOnSPServers {
 	[CmdletBinding()]
 	param(
 		[Parameter(Mandatory = $false)]
 		[ValidateNotNullOrEmpty()]
-		[array] $Servers = (Get-SPServer | ? { $_.Role -eq "Application" } | % { $_.Address }),
+		[array] $Servers = (Get-SPServers),
 		[Parameter(Mandatory = $true)]
 		[ValidateNotNullOrEmpty()]
-		[string] $Command,
+		[ScriptBlock] $Command,
 		[Parameter(Mandatory = $false)]
 		[PSCredential] $Credential,
 		[Parameter(Mandatory = $false)]
-		[int] $Timeout = 60
+		[int] $Timeout = 30,
+		[Parameter(Mandatory = $false)]
+		[switch]$DoNotUseCredSspAuthentication
 	)
 	SPLogMe
 	
 	[array]$result = @()
-	if($Command -notlike "*Add-PSSnapin Microsoft.SharePoint.PowerShell*"){
-		$Command = "Add-PSSnapin Microsoft.SharePoint.PowerShell`r`n" + $Command
+	$cmd = $Command.ToString()
+	if($cmd -notlike "*Add-PSSnapin Microsoft.SharePoint.PowerShell*"){
+		$cmd = "`r`nAdd-PSSnapin Microsoft.SharePoint.PowerShell`r`n" + $cmd
 	}
-	$Servers | % {
-		if($Credential -ne $null) {
-			$res = Invoke-Command -ComputerName $_ -Credential $Credential -ScriptBlock $Command -AsJob
-		}
-		else {
-			$res = Invoke-Command -ComputerName $_ -ScriptBlock $Command -AsJob
-		}
-		$result += $res
+	$Command = [ScriptBlock]::Create($cmd)
+	if($DoNotUseCredSspAuthentication.IsPresent) {
+		$result = (Do-ParallelOnServers -Servers $Servers -Command $Command -Timeout $Timeout -Credential $Credential)
 	}
-	$timeoutCounter = 1
-	$rTimeout = 0
-	while( $result.Count -ne ($result | ? { $_.State -eq "Completed"}).Count ){
-		$waitingfor = $result | ? {$_.State -ne "Completed"} | % { $_.Location }
-		Write-Host " Waiting for $waitingfor"
-		Start-Sleep -Seconds $timeoutCounter
-		$rTimeout += $timeoutCounter
-		if($rTimeout -gt $Timeout)
-		{
-			$str = ""
-			$result | ? { $_.State -ne "Completed"} | % { $str += (", {0}" -f $_.Location) }
-			if($str.Length -gt 2){
-				$str = $str.Substring(2)
-			}
-			Write-Host -Foreground Red "Timeout Exception for $str"
-			break
-		}
-		$timeoutCounter++
+	else {
+		$result = (Do-ParallelOnServers -Servers $Servers -Command $Command -Timeout $Timeout -Credential $Credential -UseCredSspAuthentication)
 	}
-	[array]$report = @()
-	$arrow = "{0}{1}{2}" -f [char]9584, [char]9830, [char]9588
-	$result | % { 
-		$location = $_.Location
-		if($_.State -eq "Completed"){ 
-			$report += ("{0}:`n{1}`t{2}" -f $location, $arrow, ($_ | Receive-Job) )
-		}
-		else {
-			$report += ("{0}:`n{1}`t{2}" -f $location, $arrow, $_.Jobstateinfo.State)
-		}
-	}
-	$result | Remove-Job
-	return $report
+	return $result
 }
 
 function SPLogMe {
@@ -1124,78 +1146,197 @@ function Set-EmailOptionForUserProfiles {
 }
 
 function FineTune-DistributedCaches {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)]
+		[ValidateSet("2013","2016","2019")]
+		[string]$ProductOption		
+	)
 	SPLogMe
 	
-	#DistributedLogonTokenCache
-	$DLTC = Get-SPDistributedCacheClientSetting -ContainerType DistributedLogonTokenCache
-	$DLTC.MaxConnectionsToServer = 1
-	$DLTC.requestTimeout = "3000"
-	$DLTC.channelOpenTimeOut = "3000"
-	Set-SPDistributedCacheClientSetting -ContainerType DistributedLogonTokenCache $DLTC
+	if($ProductOption -eq "2013") {
+		#DistributedLogonTokenCache
+		$DLTC = Get-SPDistributedCacheClientSetting -ContainerType DistributedLogonTokenCache
+		$DLTC.MaxConnectionsToServer = 1
+		$DLTC.requestTimeout = "3000"
+		$DLTC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedLogonTokenCache $DLTC
 
-	#DistributedViewStateCache
-	$DVSC = Get-SPDistributedCacheClientSetting -ContainerType DistributedViewStateCache
-	$DVSC.MaxConnectionsToServer = 1
-	$DVSC.requestTimeout = "3000"
-	$DVSC.channelOpenTimeOut = "3000"
-	Set-SPDistributedCacheClientSetting -ContainerType DistributedViewStateCache $DVSC
+		#DistributedViewStateCache
+		$DVSC = Get-SPDistributedCacheClientSetting -ContainerType DistributedViewStateCache
+		$DVSC.MaxConnectionsToServer = 1
+		$DVSC.requestTimeout = "3000"
+		$DVSC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedViewStateCache $DVSC
 
-	#DistributedAccessCache
-	$DAC = Get-SPDistributedCacheClientSetting -ContainerType DistributedAccessCache
-	$DAC.MaxConnectionsToServer = 1
-	$DAC.requestTimeout = "3000"
-	$DAC.channelOpenTimeOut = "3000"
-	Set-SPDistributedCacheClientSetting -ContainerType DistributedAccessCache $DAC
+		#DistributedAccessCache
+		$DAC = Get-SPDistributedCacheClientSetting -ContainerType DistributedAccessCache
+		$DAC.MaxConnectionsToServer = 1
+		$DAC.requestTimeout = "3000"
+		$DAC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedAccessCache $DAC
 
-	#DistributedActivityFeedCache
-	$DAF = Get-SPDistributedCacheClientSetting -ContainerType DistributedActivityFeedCache
-	$DAF.MaxConnectionsToServer = 1
-	$DAF.requestTimeout = "3000"
-	$DAF.channelOpenTimeOut = "3000"
-	Set-SPDistributedCacheClientSetting -ContainerType DistributedActivityFeedCache $DAF
+		#DistributedActivityFeedCache
+		$DAF = Get-SPDistributedCacheClientSetting -ContainerType DistributedActivityFeedCache
+		$DAF.MaxConnectionsToServer = 1
+		$DAF.requestTimeout = "3000"
+		$DAF.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedActivityFeedCache $DAF
 
-	#DistributedActivityFeedLMTCache
-	$DAFC = Get-SPDistributedCacheClientSetting -ContainerType DistributedActivityFeedLMTCache
-	$DAFC.MaxConnectionsToServer = 1
-	$DAFC.requestTimeout = "3000"
-	$DAFC.channelOpenTimeOut = "3000"
-	Set-SPDistributedCacheClientSetting -ContainerType DistributedActivityFeedLMTCache $DAFC
+		#DistributedActivityFeedLMTCache
+		$DAFC = Get-SPDistributedCacheClientSetting -ContainerType DistributedActivityFeedLMTCache
+		$DAFC.MaxConnectionsToServer = 1
+		$DAFC.requestTimeout = "3000"
+		$DAFC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedActivityFeedLMTCache $DAFC
 
-	#DistributedBouncerCache
-	$DBC = Get-SPDistributedCacheClientSetting -ContainerType DistributedBouncerCache
-	$DBC.MaxConnectionsToServer = 1
-	$DBC.requestTimeout = "3000"
-	$DBC.channelOpenTimeOut = "3000"
-	Set-SPDistributedCacheClientSetting -ContainerType DistributedBouncerCache $DBC
+		#DistributedBouncerCache
+		$DBC = Get-SPDistributedCacheClientSetting -ContainerType DistributedBouncerCache
+		$DBC.MaxConnectionsToServer = 1
+		$DBC.requestTimeout = "3000"
+		$DBC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedBouncerCache $DBC
 
-	#DistributedDefaultCache
-	$DDC = Get-SPDistributedCacheClientSetting -ContainerType DistributedDefaultCache
-	$DDC.MaxConnectionsToServer = 1
-	$DDC.requestTimeout = "3000"
-	$DDC.channelOpenTimeOut = "3000"
-	Set-SPDistributedCacheClientSetting -ContainerType DistributedDefaultCache $DDC
+		#DistributedDefaultCache
+		$DDC = Get-SPDistributedCacheClientSetting -ContainerType DistributedDefaultCache
+		$DDC.MaxConnectionsToServer = 1
+		$DDC.requestTimeout = "3000"
+		$DDC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedDefaultCache $DDC
 
-	#DistributedSearchCache
-	$DSC = Get-SPDistributedCacheClientSetting -ContainerType DistributedSearchCache
-	$DSC.MaxConnectionsToServer = 1
-	$DSC.requestTimeout = "3000"
-	$DSC.channelOpenTimeOut = "3000"
-	Set-SPDistributedCacheClientSetting -ContainerType DistributedSearchCache $DSC
+		#DistributedSearchCache
+		$DSC = Get-SPDistributedCacheClientSetting -ContainerType DistributedSearchCache
+		$DSC.MaxConnectionsToServer = 1
+		$DSC.requestTimeout = "3000"
+		$DSC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedSearchCache $DSC
 
-	#DistributedSecurityTrimmingCache
-	$DTC = Get-SPDistributedCacheClientSetting -ContainerType DistributedSecurityTrimmingCache
-	$DTC.MaxConnectionsToServer = 1
-	$DTC.requestTimeout = "3000"
-	$DTC.channelOpenTimeOut = "3000"
-	Set-SPDistributedCacheClientSetting -ContainerType DistributedSecurityTrimmingCache $DTC
+		#DistributedSecurityTrimmingCache
+		$DTC = Get-SPDistributedCacheClientSetting -ContainerType DistributedSecurityTrimmingCache
+		$DTC.MaxConnectionsToServer = 1
+		$DTC.requestTimeout = "3000"
+		$DTC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedSecurityTrimmingCache $DTC
 
-	#DistributedServerToAppServerAccessTokenCache
-	$DSTAC = Get-SPDistributedCacheClientSetting -ContainerType DistributedServerToAppServerAccessTokenCache
-	$DSTAC.MaxConnectionsToServer = 1
-	$DSTAC.requestTimeout = "3000"
-	$DSTAC.channelOpenTimeOut = "3000"
-	Set-SPDistributedCacheClientSetting -ContainerType DistributedServerToAppServerAccessTokenCache $DSTAC
-	
+		#DistributedServerToAppServerAccessTokenCache
+		$DSTAC = Get-SPDistributedCacheClientSetting -ContainerType DistributedServerToAppServerAccessTokenCache
+		$DSTAC.MaxConnectionsToServer = 1
+		$DSTAC.requestTimeout = "3000"
+		$DSTAC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedServerToAppServerAccessTokenCache $DSTAC
+	}
+	elseif($ProductOption -eq "2016"){
+		#DistributedLogonTokenCache
+		$DLTC = Get-SPDistributedCacheClientSetting -ContainerType DistributedLogonTokenCache
+		$DLTC.MaxConnectionsToServer = 1
+		$DLTC.requestTimeout = "3000"
+		$DLTC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedLogonTokenCache $DLTC
+
+		#DistributedViewStateCache
+		$DVSC = Get-SPDistributedCacheClientSetting -ContainerType DistributedViewStateCache
+		$DVSC.MaxConnectionsToServer = 1
+		$DVSC.requestTimeout = "3000"
+		$DVSC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedViewStateCache $DVSC
+
+		#DistributedAccessCache
+		$DAC = Get-SPDistributedCacheClientSetting -ContainerType DistributedAccessCache
+		$DAC.MaxConnectionsToServer = 1
+		$DAC.requestTimeout = "3000"
+		$DAC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedAccessCache $DAC
+
+		#DistributedActivityFeedCache
+		$DAF = Get-SPDistributedCacheClientSetting -ContainerType DistributedActivityFeedCache
+		$DAF.MaxConnectionsToServer = 1
+		$DAF.requestTimeout = "3000"
+		$DAF.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedActivityFeedCache $DAF
+
+		#DistributedActivityFeedLMTCache
+		$DAFC = Get-SPDistributedCacheClientSetting -ContainerType DistributedActivityFeedLMTCache
+		$DAFC.MaxConnectionsToServer = 1
+		$DAFC.requestTimeout = "3000"
+		$DAFC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedActivityFeedLMTCache $DAFC
+
+		#DistributedBouncerCache
+		$DBC = Get-SPDistributedCacheClientSetting -ContainerType DistributedBouncerCache
+		$DBC.MaxConnectionsToServer = 1
+		$DBC.requestTimeout = "3000"
+		$DBC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedBouncerCache $DBC
+
+		#DistributedDefaultCache
+		$DDC = Get-SPDistributedCacheClientSetting -ContainerType DistributedDefaultCache
+		$DDC.MaxConnectionsToServer = 1
+		$DDC.requestTimeout = "3000"
+		$DDC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedDefaultCache $DDC
+
+		#DistributedSearchCache
+		$DSC = Get-SPDistributedCacheClientSetting -ContainerType DistributedSearchCache
+		$DSC.MaxConnectionsToServer = 1
+		$DSC.requestTimeout = "3000"
+		$DSC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedSearchCache $DSC
+
+		#DistributedSecurityTrimmingCache
+		$DTC = Get-SPDistributedCacheClientSetting -ContainerType DistributedSecurityTrimmingCache
+		$DTC.MaxConnectionsToServer = 1
+		$DTC.requestTimeout = "3000"
+		$DTC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedSecurityTrimmingCache $DTC
+
+		#DistributedServerToAppServerAccessTokenCache
+		$DSTAC = Get-SPDistributedCacheClientSetting -ContainerType DistributedServerToAppServerAccessTokenCache
+		$DSTAC.MaxConnectionsToServer = 1
+		$DSTAC.requestTimeout = "3000"
+		$DSTAC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedServerToAppServerAccessTokenCache $DSTAC
+
+		#DistributedFileLockThrottlerCache
+		$DFLTC = Get-SPDistributedCacheClientSetting -ContainerType DistributedFileLockThrottlerCache
+		$DFLTC.MaxConnectionsToServer = 1
+		$DFLTC.requestTimeout = "3000"
+		$DFLTC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedFileLockThrottlerCache $DFLTC
+
+		#DistributedSharedWithUserCache
+		$DSWUC = Get-SPDistributedCacheClientSetting -ContainerType DistributedSharedWithUserCache
+		$DSWUC.MaxConnectionsToServer = 1
+		$DSWUC.requestTimeout = "3000"
+		$DSWUC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedSharedWithUserCache $DSWUC
+
+		#DistributedUnifiedGroupsCache
+		$DUGC = Get-SPDistributedCacheClientSetting -ContainerType DistributedUnifiedGroupsCache
+		$DUGC.MaxConnectionsToServer = 1
+		$DUGC.requestTimeout = "3000"
+		$DUGC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedUnifiedGroupsCache $DUGC 
+
+		#DistributedResourceTallyCache
+		$DRTC = Get-SPDistributedCacheClientSetting -ContainerType DistributedResourceTallyCache
+		$DRTC.MaxConnectionsToServer = 1
+		$DRTC.requestTimeout = "3000"
+		$DRTC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedResourceTallyCache $DRTC
+
+		#DistributedHealthScoreCache
+		$DHSC = Get-SPDistributedCacheClientSetting -ContainerType DistributedHealthScoreCache
+		$DHSC.MaxConnectionsToServer = 1
+		$DHSC.requestTimeout = "3000"
+		$DHSC.channelOpenTimeOut = "3000"
+		Set-SPDistributedCacheClientSetting -ContainerType DistributedHealthScoreCache $DHSC
+	}
+	elseif($ProductOption -eq "2019"){
+		Write-Host "Not implemented yet" -ForegroundColor Yellow
+	}
+	else{
+		Write-Error "Invalid option"
+	}
 }
 
 function Get-SPManagedAccountsPassword {
@@ -1239,7 +1380,7 @@ function Do-GracefulShutdownDistributedCacheServices {
 		[Parameter(Mandatory = $true)]
 		[ValidateScript(
 			{
-				$_ -in (Get-SPServer | ? {($_.ServiceInstances | % TypeName) -contains 'Distributed Cache'} | % Address )
+				$_ -in (Get-SPDistributedCacheServers)
 			}
 		)]
 		[string]$DistributedCacheHostName = $env:COMPUTERNAME
@@ -1376,10 +1517,10 @@ function RestartAll-SPTimerJobServices {
 	switch ($NodeByNode.IsPresent) {
 		$false {
 			if($Credential -eq $null) {
-				return (DoParallel-OnSPServers -Command $scriptBlock)
+				return (Do-ParallelOnSPServers -Command $scriptBlock)
 			}
 			else {
-				return (DoParallel-OnSPServers -Credential $Credential -Command $scriptBlock)
+				return (Do-ParallelOnSPServers -Credential $Credential -Command $scriptBlock)
 			}
 		}
 		$true {			
@@ -1418,10 +1559,10 @@ function RecycleAll-SPWebApplicatonPools {
 	switch ($NodeByNode.IsPresent) {
 		$false {
 			if($Credential -eq $null) {
-				return (DoParallel-OnSPServers -Command $scriptBlock)
+				return (Do-ParallelOnSPServers -Command $scriptBlock)
 			}
 			else {
-				return (DoParallel-OnSPServers -Credential $Credential -Command $scriptBlock)
+				return (Do-ParallelOnSPServers -Credential $Credential -Command $scriptBlock)
 			}
 		}
 		$true {			
@@ -1663,122 +1804,183 @@ function Update-SPUserProfileNewsfeedPrivacy {
 
 function Deploy-WSPSolutions {
 	[CmdletBinding()]
-	param (
-		[Parameter(Mandatory = $true,HelpMessage = 'Enter a hostname')]
+	Param (
+		[Parameter(Mandatory = $false, Position = 0, HelpMessage = 'Enter a hostname')]
 		[ValidateNotNullOrEmpty()]
-		[string]$Hostname = "",
-		[Parameter(Mandatory = $false,HelpMessage = 'Enter a URL to deploy the solution')]
-		[ValidateScript(
-			{
-				if($env:COMPUTERNAME -eq $Hostname) {
-					$sites = (Get-SPWebApplication | % Url )					
-				}
-				else {
-					$sites = (Invoke-Command -ComputerName $Hostname -ScriptBlock { return (Get-SPWebApplication | % Url) } )
-				}
-				foreach($site in $_){
-					$site -in $sites
-				}
-			}
-		)]
-		[array]$SiteCollectionUrl,
-		[Parameter(Mandatory = $true,HelpMessage = 'Enter a valid path which contains WSP packages')]
+		[string]$Hostname = ($env:COMPUTERNAME),
+		[Parameter(Mandatory = $true, Position = 2, HelpMessage = 'Enter a valid path which contains WSP packages')]
 		[ValidateNotNullOrEmpty()]
 		[string]$DestinationUrl,
-		[Parameter(Mandatory = $false,HelpMessage = 'Redeploy solutions to already deployed web applications')]
-		[switch]$RedeployWebApps
-	)
-	SPLogMe
-	
-	try {
-		$reDeploySolution = $false
-		switch ($RedeployWebApps.IsPresent) {
-			$false {
-				$reDeploySolution = $false
+		[Parameter(Mandatory = $false, Position = 3, HelpMessage = 'Redeploy solutions to already deployed web applications')]
+		[switch]$RedeployWebApps,
+		[Parameter(Mandatory = $true)]
+		[PSCredential] $Credential
+	)	
+	DynamicParam {
+        $WebApplicationParamAttribute = New-Object System.Management.Automation.ParameterAttribute
+        $WebApplicationParamAttribute.Position = 1
+        $WebApplicationParamAttribute.Mandatory = $false
+        $WebApplicationParamAttribute.HelpMessage = "Enter a URL to deploy the solution"
+		
+		[ScriptBlock] $sb = {}
+		if($_.Count -eq 0){
+				$sb = {$true} 
+		}
+		else{
+			if($env:COMPUTERNAME -eq $Hostname) {
+				$sb = {
+					$sites = (Get-SPWebApplication | % Url )
+					foreach($site in $_){
+						$site -in $sites
+					}
+				} 				
 			}
-			$true {
-				$reDeploySolution = $true
-			}
+			else {
+				$sb = {
+					$sites = (Invoke-Command -ComputerName $Hostname -ScriptBlock { return (Get-SPWebApplication | % Url) } )
+					foreach($site in $_){
+						$site -in $sites
+					}
+				}
+			}			
 		}
 		
-		$result = (Invoke-Command -ComputerName $Hostname -ScriptBlock {			
-			Import-Module UberSPShell			
-			function Deploy-WSP ($webApp, $wspURL, $redeploy) {
-				try {
-					$wspFiles = Get-ChildItem $wspURL | ? { !($_.psiscontainer) } | ? { $_.Name -like "*.wsp" } 
-					foreach ($file in $wspFiles) {
-						$solution = Get-SPSolution -Identity $file.Name
-						$urls = $solution.DeployedWebApplications.Url
-						if ($solution.Deployed -eq $true) {
-							Write-Host -ForegroundColor Green "Uninstalling the solution $($solution.Name) ... "
-							if ($solution.ContainsWebApplicationResource) {
+        $WebApplicationValidateScriptParam = New-Object System.Management.Automation.ValidateScriptAttribute($sb)
+        
+        $attributeCollection = New-Object System.Collections.ObjectModel.Collection[System.Attribute]
+        $attributeCollection.Add($WebApplicationParamAttribute)
+        $attributeCollection.Add($WebApplicationValidateScriptParam)
+        
+		$WebApplicationParam = New-Object System.Management.Automation.RuntimeDefinedParameter('WebApplicationUrl', [array], $attributeCollection)
+        
+		$paramDictionary = New-Object System.Management.Automation.RuntimeDefinedParameterDictionary
+        $paramDictionary.Add('WebApplicationUrl', $WebApplicationParam)
+        
+		return $paramDictionary
+	}	
+	Process {
+		SPLogMe
+		try {
+			$reDeploySolution = $false
+			switch ($RedeployWebApps.IsPresent) {
+				$false {
+					$reDeploySolution = $false
+				}
+				$true {
+					$reDeploySolution = $true
+				}
+			}		
+			$scriptBlock = {
+				Import-Module UberSPShell
+				
+				$iWspURL = $args[0]
+				$iWebApp = $args[1]				
+				$iRedeploy = $args[2]
+				
+				function Deploy-WSP {
+					param (
+						[array]$webApp,
+						[string]$wspURL,
+						[bool]$redeploy
+					)		
+					
+					try {
+						$wspFiles = Get-ChildItem $wspURL | ? { !($_.psiscontainer) } | ? { $_.Name -like "*.wsp" } 
+						foreach ($file in $wspFiles) {
+							$solution = Get-SPSolution | ? { $_.Name -eq $file.Name }						
+							if($solution){
+								if ($solution.Deployed -eq $true) {
+									$urls = $solution.DeployedWebApplications.Url
+									Write-Host -ForegroundColor Green "Uninstalling the solution $($solution.Name) ... "
+									if ($solution.ContainsWebApplicationResource) {
+										foreach($url in $urls) {
+											Write-Host -NoNewline " $url"
+											Uninstall-SPSolution -Identity $solution.Name -WebApplication $url -ErrorAction Stop -Confirm:$false
+										}
+									}
+									else {
+										Uninstall-SPSolution -Identity $solution.Name -Confirm:$false
+									}
+									Write-Host -NoNewline " ... waiting to finish "
+									while ((Get-SPSolution -Identity $solution.Name).JobExists) {
+										Write-Host -NoNewline .
+										Start-Sleep -Seconds 1
+									}
+									Remove-SPSolution -Identity $solution.Name -Force -Confirm:$false
+									Write-Host " done!" -ForegroundColor Green
+								}
+								else {
+									Write-Host -ForegroundColor Green "Removing the solution $($solution.Name) ... "
+									Remove-SPSolution -Identity $solution.Name -Force -Confirm:$false
+									Write-Host " done!" -ForegroundColor Green
+									Write-Host ""
+								}
+							}
+							Write-Host -ForegroundColor Green "Installing your solution to ..." -NoNewline
+							Add-SPSolution -LiteralPath $file.FullName
+							if($redeploy -eq $true) {
 								foreach($url in $urls) {
-									Write-Host -NoNewline " $url"
-									Uninstall-SPSolution -Identity $solution.Name -WebApplication $url -ErrorAction Stop -Confirm:$false
+									Write-Host -NoNewline " $url`n"								
+									Install-SPSolution -WebApplication $url -GACDeployment -FullTrustBinDeployment -Identity $file.Name -CompatibilityLevel All -ErrorAction Stop -Force						
+								}
+							}
+							if($webApp.Count -gt 0) {
+								foreach($url in $webApp) {
+									Write-Host -NoNewline " $url`n"
+									Install-SPSolution -WebApplication $url -GACDeployment -FullTrustBinDeployment -Identity $file.Name -CompatibilityLevel All -ErrorAction Stop -Force							
 								}
 							}
 							else {
-								Uninstall-SPSolution -Identity $solution.Name -Confirm:$false
-							}
-							Write-Host -NoNewline "Waiting to finish "
-							while ((Get-SPSolution -Identity $solution.Name).JobExists) {
-								Write-Host -NoNewline .
-								Start-Sleep -Seconds 1
-							}
-							Remove-SPSolution -Identity $solution.Name -Force -Confirm:$false
-							Write-Host -NoNewline " done!"
+								Write-Host -NoNewline " Global`n"
+								Install-SPSolution -GACDeployment -FullTrustBinDeployment -Identity $file.Name -CompatibilityLevel All -ErrorAction Stop -Force
+							}						
 						}
-						Write-Host -ForegroundColor Green "Installing your solution to ..."
-						Add-SPSolution -LiteralPath $file.FullName
-						if($redeploy -eq $true) {
-							foreach($url in $urls) {
-								Write-Host -NoNewline " $url"
-								Install-SPSolution -WebApplication $url -GACDeployment -FullTrustBinDeployment -Identity $file.Name -CompatibilityLevel All -ErrorAction Stop							
-							}
-						}
-						if($webApp.Count -gt 0) {
-							foreach($url in $webApp) {
-								Write-Host -NoNewline " $url"
-								Install-SPSolution -WebApplication $url -GACDeployment -FullTrustBinDeployment -Identity $file.Name -CompatibilityLevel All -ErrorAction Stop								
-							}
-						}
-						else {
-							Write-Host -NoNewline " Global"
-							Install-SPSolution -GACDeployment -FullTrustBinDeployment -Identity $file.Name -CompatibilityLevel All -ErrorAction Stop
-						}						
+					}
+					catch {
+						$ErrorMessage = $_.Exception.Message
+						throw $ErrorMessage
 					}
 				}
+				
+				$backupPath = Backup-WSPSolutions -Credential $Credential
+				try {
+					Do-ParallelOnSPServers -Command { Stop-Service -Name "SPTimerV4" } -Credential $Credential
+					Do-ParallelOnSPServers -Command { Start-Service -Name "SPTimerV4" } -Credential $Credential
+					Deploy-WSP -webApp $iWebApp -wspURL $iWspURL -redeploy $iRedeploy
+					Do-ParallelOnSPServers -Command { Stop-Service -Name "SPTimerV4" } -Credential $Credential
+					Do-ParallelOnSPServers -Command { Start-Service -Name "SPTimerV4" } -Credential $Credential
+				}
 				catch {
-					$ErrorMessage = $_.Exception.Message
-					throw $ErrorMessage
+					Write-Host -ForegroundColor Red " Failed to deploy, rollback solution..."
+					try {
+						#backupPath içerisinde wsp varsa işlemlere devam et.
+						Do-ParallelOnSPServers -Command { Stop-Service -Name "SPTimerV4" } -Credential $Credential
+						Do-ParallelOnSPServers -Command { Start-Service -Name "SPTimerV4" } -Credential $Credential
+						Deploy-WSP -webApp $iWebApp -wspURL $backupPath -redeploy $iRedeploy
+						Do-ParallelOnSPServers -Command { Stop-Service -Name "SPTimerV4" } -Credential $Credential
+						Do-ParallelOnSPServers -Command { Start-Service -Name "SPTimerV4" } -Credential $Credential
+					}
+					catch {
+						Write-Host -ForegroundColor Red "FATAL ERROR! Unable to deploy the backed up packages!"
+						throw "FATAL ERROR! Unable to deploy the backed up packages!"
+					}
+					throw " Failed to deploy, rollback solution..."
 				}
 			}
 			
-			$backupPath = Backup-WSPSolutions
-			try {
-				DoParallel-OnSPServers -Command { Stop-Service -Name "SPTimerV4" }
-				Deploy-WSP ($args[1], $args[0], $args[2])
-				DoParallel-OnSPServers -Command { Start-Service -Name "SPTimerV4" }
+			$result = "No data!"
+			if($env:COMPUTERNAME -eq $Hostname) {		
+				$result = (Invoke-Command -ScriptBlock $scriptBlock -Args $DestinationUrl, $PSBoundParameters['WebApplicationUrl'], $reDeploySolution)
 			}
-			catch {
-				Write-Host -ForegroundColor Red "Failed to deploy, rollback solution..."
-				try {
-					DoParallel-OnSPServers -Command { Stop-Service -Name "SPTimerV4" }
-					Deploy-WSP ($args[1], $backupPath, $args[2])
-					DoParallel-OnSPServers -Command { Start-Service -Name "SPTimerV4" }
-				}
-				catch {
-					Write-Host -ForegroundColor Red "FATAL ERROR! Unable to deploy the backed up packages!"
-					throw "FATAL ERROR! Unable to deploy the backed up packages!"
-				}
-				throw "Failed to deploy, rollback solution..."
-			}
-		} -Args $DestinationUrl, $SiteCollectionUrl, $reDeploySolution )		
-		Write-Host $result
-	}
-	catch {
-		$ErrorMessage = $_.Exception.Message
-		throw $ErrorMessage
+			else {
+				$result = (Invoke-Command -ComputerName $Hostname -ScriptBlock $scriptBlock -Args $DestinationUrl, $PSBoundParameters['WebApplicationUrl'], $reDeploySolution)
+			}		
+			Write-Host $result
+		}
+		catch {
+			$ErrorMessage = $_.Exception.Message
+			throw $ErrorMessage
+		}
 	}
 }
 
@@ -2553,7 +2755,7 @@ function Repopulate-SPSiteCollectionFeeds {
 		[string]$SiteUrl,
 		[Parameter(Mandatory = $false)]
 		[ValidateNotNullOrEmpty()]
-		[string]$ProxyName = "User Profile Service Application"
+		[string]$ProxyName = "User Profile Service Application Proxy"
 	)
 	SPLogMe
 	
@@ -2565,20 +2767,34 @@ function Repopulate-SPSiteCollectionFeeds {
 	Update-SPRepopulateMicroblogLMTCache -ProfileServiceApplicationProxy $proxy
 	# Obtain Service Context based on URL
 	$siteCollections = Get-SPsite -Identity "$SiteUrl/.*" -Regex -Limit ALL #Get-SPSite $SiteUrl
+	$siteCollectionsCount = $siteCollections.Count
+	$siteCollectionsCounter = 1
+	$feedCounter = 0
 	foreach ($siteCollection in $siteCollections) {
 		$context = Get-SPServiceContext $siteCollection
 		# Access the user profiles through the context
 		$UserProfileManager = New-Object Microsoft.Office.Server.UserProfiles.UserProfileManager($context)
+		$upmCount = $UserProfileManager.Count
+		$upmCounter = 0
+		Write-Progress "Site Collection: $($siteCollection.Url) | $siteCollectionsCounter/$siteCollectionsCount" -perc (($siteCollectionsCounter/$siteCollectionsCount)*100) -id 1
 		$profiles = $UserProfileManager.GetEnumerator()
+		Update-SPRepopulateMicroblogFeedCache -ProfileServiceApplicationProxy $proxy -SiteUrl $siteCollection.Url
 		# Perform the cache repopulation for each user
-		foreach ($profile in $profiles) {
+		foreach ($profile in $profiles) {			
 			if ($profile.item("SPS-PersonalSiteCapabilities").Value -eq 14) {
-				$AccountName = $profile.item("AccountName").Value
-				Write-Host "Updating the Newsfeed for $AccountName"
+				$feedCounter++
+				$AccountName = $profile.item("AccountName").Value				
 				Update-SPRepopulateMicroblogFeedCache -ProfileServiceApplicationProxy $proxy -AccountName $AccountName
 			}
+			$upmCounter++
+			Write-Progress "$upmCounter/$upmCount | $feedCounter Microblog Feed Cache Repopulation is started so far | Profile: $($profile.DisplayName)" -perc (($upmCounter/$upmCount)*100) -id 2 -parentid 1
 		}
+		Write-Progress -id 2 -Completed -activity "Completed"
+		$siteCollection.Dispose()
+		$siteCollectionsCounter++
 	}
+	Write-Progress -id 1 -Completed -activity "Completed"	
+	Write-Host "$feedCounter Microblog Feed Cache Repopulation Job started."
 	# Dispose of process memory
 	Stop-SPAssignment -Global
 }
@@ -2771,8 +2987,538 @@ function Set-SPQuotaToSiteCollection {
 	Set-SPSite -Identity $Site -QuotaTemplate $TemplateName
 }
 
+function Enable-CredSSPonSPServersAsClient {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)]
+		[PSCredential] $Credential,
+		[Parameter(Mandatory = $false)]
+		[int] $Timeout = 120
+	)
+	SPLogMe	
+	
+	$Command = {
+		Import-Module UberSPShell
+		Enable-CredSSPForClientRole -Servers (Get-SPServers)
+	}	
+	Do-ParallelOnSPServers -Command $Command -Credential $Credential -Timeout $Timeout
+}
+
+function Enable-CredSSPonSPServersAsServer {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)]
+		[PSCredential] $Credential,
+		[Parameter(Mandatory = $false)]
+		[int] $Timeout = 120
+	)
+	SPLogMe	
+	
+	$Command = {
+		Import-Module Easy-Peasy
+		Enable-CredSSPForServerRole
+	}	
+	Do-ParallelOnSPServers -Command $Command -Credential $Credential -DoNotUseCredSspAuthentication -Timeout $Timeout
+}
+
+function Clear-SPConfigCache {
+	SPLogMe	
+	
+	Stop-Service SPTimerV4
+	$folders = Get-ChildItem "$env:ProgramData\Microsoft\Sharepoint\Config"
+	foreach ($folder in $folders){
+		$cacheIni = $folder.GetFiles("cache.ini")
+		if($cacheIni){
+			$xmlFiles = $folder.GetFiles("*.xml")
+			$xmlFiles | % { $_.Delete() }
+			Set-Content 1 -Path $cacheIni.FullName
+		}
+	}
+	Start-Service SPTimerV4
+}
+
+<#
+    .SYNOPSIS
+        Install-SPPatch
+    .DESCRIPTION
+        Install-SPPatch reduces the amount of time it takes to install SharePoint patches. This cmdlet supports SharePoint 2013 and above.
+    .PARAMETER PatchPath
+        The folder where the patch file(s) reside.
+    .PARAMETER Pause
+        Pauses the Search Service Application(s) prior to stopping the SharePoint Search Services.
+    .PARAMETER Stop
+        Stop the SharePoint Search Services without pausing the Search Service Application(s).
+    .PARAMETER SilentInstall
+        Silently installs the patches without user input. Not specifying this parameter will cause each patch to prompt to install.
+    .PARAMETER KeepSearchPaused
+        Keeps the Search Service Application(s) in a paused state after the installation of the patch has completed. Useful for when applying the patch to multiple
+        servers in the farm. Default to false.
+    .PARAMETER OnlySTS
+        Only apply the STS (non-language dependent) patch. This switch may be used when only an STS patch is available.
+    .EXAMPLE
+        Install-SPPatch -PatchPath C:\Updates -Pause -SilentInstall
+
+        Install the available patches in C:\Updates, pauses the Search Service Application(s) on the farm, and performs a silent installation.
+    .EXAMPLE
+        Install-SPPatch -PatchPath C:\Updates -Pause -KeepSearchPaused:$true -SilentInstall
+
+        Install the available patches in C:\Updates, pauses the Search Service Application(s) on the farm, 
+        does not resume the Search Service Application(s) after the installation is complete, and performs a silent installation.
+    .NOTES
+        Author: Trevor Seward
+        Date: 01/16/2020
+		
+		Forked & Modified by:
+		Fırat Akcan
+        Date: 06/10/2020
+    .LINK
+        https://github.com/fakcan
+#>
+
+function Install-SPPatch {
+	[CmdletBinding()]
+    param(        
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string] $PatchPath,        
+        [Parameter(Mandatory = $true, ParameterSetName = "PauseSearch")]
+        [switch] $Pause,        
+        [Parameter(Mandatory = $true, ParameterSetName = "StopSearch")]
+        [switch] $Stop,        
+        [Parameter(Mandatory = $false, ParameterSetName = "PauseSearch")]
+        [switch] $KeepSearchPaused = $false,        
+        [Parameter(Mandatory = $false)]
+        [switch] $SilentInstall,        
+        [Parameter(Mandatory = $false)]
+        [switch] $OnlySTS,
+		[Parameter(Mandatory = $false)]
+        [switch] $FastPatchMode,
+		[Parameter(Mandatory = $true,HelpMessage = "All, JustNeeded")]
+		[ValidateSet('All','JustNeeded')]
+        [string] $RebootAfterApplyingPatch,
+		[Parameter(Mandatory = $true)]
+		[PSCredential] $Credential
+    )
+	SPLogMe
+
+    $version = (Get-SPFarm).BuildVersion
+    $majorVersion = $version.Major
+    
+    Write-Host "Current build: $version"
+	if ($majorVersion -lt '15') {
+        throw "This cmdlet supports SharePoint 2013 and above."
+    }
+	
+	$filteredFilesCommand = Fill-TemplateWithArguments {
+		$filteredFiles = '*.cab', '*.exe' | % { Get-ChildItem -LiteralPath {PatchPath} -Filter $_ } | ? {
+			$_.Name -match 'sts([A-Za-z0-9\-]+).exe' -or
+			$_.Name -match 'wssloc([A-Za-z0-9\-]+).exe' -or
+			$_.Name -match '([A-Za-z0-9\-]+)2013-kb([A-Za-z0-9\-]+)glb.exe' -or
+			$_.Name -match 'ubersrv_([0-9]+).cab'
+		}
+		Test-Path $filteredFiles.FullName
+	} -Keywords @{'PatchPath'=$PatchPath}
+	
+	$filteredFiles = Invoke-Command -ScriptBlock $filteredFilesCommand	
+	if($filteredFiles){
+		Write-Host "Checking the patch files on all the servers..."
+		$ServersToCopy = Do-ParallelOnSPServers -Command $filteredFilesCommand -Credential $Credential | ? { $_ -like  "*Failed: Cannot find path*" } | % { $_.split(':')[0].replace("`n","") }
+		if($ServersToCopy){
+			Write-Host "Copying patches to the server(s):`n$ServersToCopy"
+			CopyTo-AsParallel -Servers $ServersToCopy -SourcePath $PatchPath -DestinationPath $PatchPath -SimplexCopy -Timeout 86400
+		}
+		else{
+			Write-Host "The patch files are on all the servers."
+		}
+	}
+	else{
+		throw "Unable to retrieve the file(s). Aborted!"
+	}
+	
+	$startTime = Get-Date
+	
+	$searchSvcRunning = $false
+    $oSearchSvc = Get-Service "OSearch$majorVersion" 
+    $sPSearchHCSvc = Get-Service "SPSearchHostController"	
+	
+    if (($oSearchSvc.status -eq 'Running') -or ($sPSearchHCSvc.status -eq 'Running')) { 
+        $searchSvcRunning = $true
+        if ($Pause) { 
+            $ssas = Get-SPEnterpriseSearchServiceApplication
+            foreach ($ssa in $ssas) {
+                Write-Host -ForegroundColor Yellow "Pausing the Search Service Application: $($ssa.DisplayName)"
+                Write-Host -ForegroundColor Yellow "    This could take a few minutes..."
+                Suspend-SPEnterpriseSearchServiceApplication -Identity $ssa | Out-Null
+            }
+        }
+        elseif ($Stop) { 
+            Write-Host -ForegroundColor Cyan "    Continuing without pausing the Search Service Application"
+        }
+    }
+	
+	$patchResult = $null
+	
+	$PatchCommand = Fill-TemplateWithArguments -Keywords @{"OnlySTS" = "$OnlySTS"; "PatchPath" = "$PatchPath"; "FastPatchMode" = "$FastPatchMode"; "SilentInstall" = "$SilentInstall"} -Template {
+		$version = (Get-SPFarm).BuildVersion
+		$majorVersion = $version.Major    
+		$exitRebootCodes = @(3010, 17022)    
+		if ($majorVersion -eq '16') {
+			$sts = Get-ChildItem -LiteralPath {PatchPath}  -Filter *.exe | ? { $_.Name -match 'sts([A-Za-z0-9\-]+).exe' }
+			$wssloc = Get-ChildItem -LiteralPath {PatchPath}  -Filter *.exe | ? { $_.Name -match 'wssloc([A-Za-z0-9\-]+).exe' }
+			
+			if("{OnlySTS}" -eq "True"){
+				if ($sts -eq $null) {
+					Write-Output 'Missing the sts patch. Please make sure the sts patch present in the specified directory.'
+					return            
+				}
+			}
+			else {
+				if ($sts -eq $null -and $wssloc -eq $null) {
+					Write-Output 'Missing the sts and wssloc patch. Please make sure both patches are present in the specified directory.'
+					return
+				}
+
+				if ($sts -eq $null -or $wssloc -eq $null) {
+					Write-Output '[Warning] Either the sts and wssloc patch is not available. Please make sure both patches are present in the same directory or safely ignore if only single patch is available.'
+					return
+				}
+			}			
+			if("{OnlySTS}" -eq "True"){
+				$patchfiles = $sts
+				Write-Output "Installing $sts"
+			}
+			else {
+				$patchfiles = $sts, $wssloc
+				Write-Output "Installing $sts and $wssloc"
+			}
+		}
+		elseif($majorVersion -eq '15'){
+			$patchfiles = Get-ChildItem -LiteralPath {PatchPath}  -Filter *.exe | ? { $_.Name -match '([A-Za-z0-9\-]+)2013-kb([A-Za-z0-9\-]+)glb.exe' }        
+			if ($patchfiles -eq $null){ 
+				Write-Output "Unable to retrieve the file(s). Aborted!"
+				return 
+			}
+			Write-Output "Installing $patchfiles"
+		}
+		elseif($majorVersion -lt '15'){
+			Write-Output "This cmdlet supports SharePoint 2013 and above."
+			return
+		}
+		
+		if("{FastPatchMode}" -eq "True"){
+			Write-Output "Stopping SP services"
+			Stop-SPWindowsServices 
+			Write-Output "SP Services are stopped"
+		}
+		$patchStartTime = Get-Date		
+		foreach ($patchfile in $patchfiles){
+			$filename = $patchfile.Fullname
+			Unblock-File -Path $filename -Confirm:$false
+			if("{SilentInstall}" -eq "True"){
+				$process = Start-Process $filename -ArgumentList '/passive /quiet' -PassThru -Wait
+			}
+			else{
+				$process = Start-Process $filename -ArgumentList '/norestart' -PassThru -Wait
+			}
+			if ($exitRebootCodes.Contains($process.ExitCode)){
+				Write-Output "Reboot required: $true"
+			}
+			Write-Output "Patch $patchfile installed with Exit Code $($process.ExitCode)"
+		}			
+		$patchEndTime = Get-Date
+		Write-Output ("Patch installation completed in {0:g}" -f ($patchEndTime - $patchStartTime))
+		if("{FastPatchMode}" -eq "True"){
+			Write-Output "Starting SP services"		
+			Start-SPWindowsServices
+			Write-Output "SP Services are started"
+		}
+	}
+	
+	if($FastPatchMode){				
+		$patchResult = Do-ParallelOnSPServers -Credential $Credential -Command $PatchCommand -Timeout 86400
+	}
+	else{
+		$patchResult = Do-SequentialOnSPServers -Credential $Credential -Command $PatchCommand
+	}
+
+    ### Resuming Search Service Application if paused ### 
+    if ($Pause -and $KeepSearchPaused -eq $false){ 
+        $ssas = Get-SPEnterpriseSearchServiceApplication
+        foreach ($ssa in $ssas) {
+            Write-Host -ForegroundColor Yellow "Resuming the Search Service Application: $($ssa.DisplayName)"
+            Write-Host -ForegroundColor Yellow "    This could take a few minutes..."
+            Resume-SPEnterpriseSearchServiceApplication -Identity $ssa | Out-Null
+        }
+    }
+    elseif ($pause -and $KeepSearchPaused -eq $true){
+        Write-Host -ForegroundColor Yellow "Not resuming the Search Service Application(s)"
+    }
+	
+    $endTime = Get-Date
+    Write-Host -ForegroundColor Green "Services are started"
+    Write-Host 
+    Write-Host 
+    Write-Host -ForegroundColor Yellow ("Applying patch is completed in {0:g}" -f ($endTime - $startTime))
+    Write-Host -ForegroundColor Yellow "Started:"  $startTime 
+    Write-Host -ForegroundColor Yellow "Finished:"  $endTime 
+    
+	[System.Collections.Arraylist] $ServersToBeRebooted = $null
+	if($RebootAfterApplyingPatch -eq "All"){
+		$ServersToBeRebooted = (Get-SPServers).ToLower()
+	}
+	else{
+		$ServersToBeRebooted = ($patchResult | ? { $_ -like  "*Reboot required: True*" } | % { $_.split(':')[0].replace("`n","") }).ToLower()
+	}		
+	
+	if($ServersToBeRebooted){			
+		$Command = { 
+			Import-Module UberSPShell
+			if((Get-HostName).ToUpper() -in (Get-SPDistributedCacheServers)){
+				Do-GracefulShutdownDistributedCacheServices -DistributedCacheHostName (Get-HostName)
+				Start-Sleep -Seconds 15
+			}
+			Start-Process shutdown.exe -ArgumentList "/r /t 15 /c AutoSPPatchProcess /f /d p:4:2"
+		}
+		
+		$Servers = $ServersToBeRebooted.Clone()
+		$Servers.Remove((Get-HostName -FQDN))
+		$Servers.Remove((Get-HostName))		
+		if($FastPatchMode){
+			Write-Host -ForegroundColor Yellow "Reboot required! All SP servers will be rebooted simultaneously except the distributed cache server(s), it/they will be rebooted sequentially."
+			
+			Get-SPDistributedCacheServers | % { $Servers.Remove($_.ToLower()) }			
+			Do-ParallelOnSPServers -Credential $Credential -Servers $Servers -Command $Command			
+			Do-SequentialOnSPServers -Credential $Credential -Servers ($ServersToBeRebooted | ? { $_ -in (Get-SPDistributedCacheServers) }) -Command $Command			
+		}
+		else{
+			Write-Host -ForegroundColor Yellow "Reboot required! All SP servers will be rebooted one by one..."			
+			Do-SequentialOnSPServers -Credential $Credential -Servers $Servers -Command $Command
+		}
+		
+		if((Get-HostName) -in $ServersToBeRebooted){
+			Write-Host -ForegroundColor Yellow "This server is going to be rebooted... Please try to connect again in a few seconds and run 'Invoke-SPConfigWizard'! Bye bye..."
+			Start-Sleep -Seconds 3
+			Invoke-Command -ScriptBlock $Command
+		}
+    }
+	else{
+		if($FastPatchMode){
+			Write-Host "Running 'Invoke-SPConfigWizard' automatically cause 'FastPatchMode' is declared."
+			Invoke-SPConfigWizard -Credential $Credential
+		}
+		else{
+			Write-Host "Please run 'Invoke-SPConfigWizard' when the farm is ready."
+		}
+	}
+	
+}
+
+function Get-SPDistributedCacheServers {
+	SPLogMe
+	
+	[array] $servers = Get-SPServer | ? {($_.ServiceInstances | % TypeName) -contains 'Distributed Cache'} | % { $_.Address }
+	
+	return $servers
+}
+
+<#
+    .SYNOPSIS
+        Invoke-SPConfigWizard
+    .DESCRIPTION
+        Invoke-SPConfigWizard runs psconfig.exe on the all SharePoint servers with the necessary parameters to update.         
+    .EXAMPLE
+        Invoke-SPConfigWizard
+
+        Runs the Config Wizard with all the necessary switches to update the all SharePoint servers.
+    .NOTES
+        Author: Fırat Akcan
+        Date: 09/06/2020
+    .LINK
+        https://github.com/fakcan
+#>
+function Invoke-SPConfigWizard {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $false)]
+		[PSCredential] $Credential = $null,
+		[Parameter(Mandatory = $false)]
+		[switch]$DoNotUseCredSspAuthentication
+	)
+	SPLogMe
+	
+    $Command = { 
+		Start-Process PSConfig.exe -ArgumentList "-cmd upgrade -inplace b2b -wait -cmd applicationcontent -install -cmd installfeatures -cmd secureresources -cmd services -install" -Wait 
+		Start-Process iireset.exe -ArgumentList "/start" -Wait
+	}
+	
+	if($DoNotUseCredSspAuthentication.IsPresent) {
+		Do-SequentialOnSPServers -Command $Command -Credential $Credential -DoNotUseCredSspAuthentication
+	}
+	else{
+		Do-SequentialOnSPServers -Command $Command -Credential $Credential
+	}
+}
+
+function Do-SequentialOnSPServers {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $false)]
+		[ValidateNotNullOrEmpty()]
+		[array] $Servers = (Get-SPServers),
+		[Parameter(Mandatory = $true)]
+		[ValidateNotNullOrEmpty()]
+		[ScriptBlock] $Command,
+		[Parameter(Mandatory = $false)]
+		[PSCredential] $Credential,
+		[Parameter(Mandatory = $false)]
+		[int] $Timeout = 86400, # Default 1-day wait time
+		[Parameter(Mandatory = $false)]
+		[switch] $DoNotUseCredSspAuthentication
+	)
+	SPLogMe
+	
+	$cmd = $Command.ToString()
+	if($cmd -notlike "*Add-PSSnapin Microsoft.SharePoint.PowerShell*"){
+		$cmd = "`r`nAdd-PSSnapin Microsoft.SharePoint.PowerShell -ErrorAction Continue`r`n" + $cmd
+	}
+	$Command = [ScriptBlock]::Create($cmd)	
+	
+	[array]$report = @()
+	$watch = [System.Diagnostics.StopWatch]::StartNew()	
+	
+	$Servers | % {
+		$job = $null
+		if($_ -Eq (Get-HostName) -Or $_ -Eq (Get-HostName -FQDN)){
+			$job = (Start-JobInProcess -ScriptBlock $Command -Name ("JobOn_"+$_))
+		}
+		else{			
+			if($Credential -ne $null) {
+				if($DoNotUseCredSspAuthentication.IsPresent) {					
+					$tmp = Fill-ScriptBlockWithArguments -Command {param($Credential) Invoke-Command -ComputerName {0} -Credential $Credential -ScriptBlock {{1}}} -Arguments @($_, $Command)
+				}
+				else {					
+					$tmp = Fill-ScriptBlockWithArguments -Command {param($Credential) Invoke-Command -Authentication CredSsp -ComputerName {0} -Credential $Credential -ScriptBlock {{1}}} -Arguments @($_, $Command)					
+				}
+				$job = (Start-JobInProcess -ScriptBlock $tmp -ArgumentList $Credential -Name ("JobOn_"+$_))
+			}
+			else {
+				if($DoNotUseCredSspAuthentication.IsPresent) {
+					$tmp = Fill-ScriptBlockWithArguments -Command {Invoke-Command -ComputerName {0} -ScriptBlock {{1}}} -Arguments @($_, $Command)
+				}
+				else {
+					$tmp = Fill-ScriptBlockWithArguments -Command {Invoke-Command -Authentication CredSsp -ComputerName {0} -ScriptBlock {{1}}} -Arguments @($_, $Command)
+				}
+				$job = (Start-JobInProcess -ScriptBlock $tmp -Name ("JobOn_"+$_))
+			}
+		}
+		
+		$timeoutCounter = 1
+		$rTimeout = 0
+		while($job.State -ne "Completed" ){
+			Start-Sleep -Seconds $timeoutCounter
+			$rTimeout += $timeoutCounter
+			if($rTimeout -gt $Timeout) {
+				Write-Host -Foreground Red "Timeout Exception for $_"
+				break
+			}
+			$timeoutCounter++
+		}
+		
+		$tmpReport = $null
+		if($job.State -eq "Completed"){ 			
+			try{				
+				$jobResult = "Completed`t" + (Receive-Job $job -ErrorAction Stop | Out-String)
+			}
+			catch {				
+				$jobResult = "Failed: " + $_.Exception.Message
+			}
+			$tmpReport = ("`n{0}:`n{1}" -f $_, $jobResult )
+		}
+		else {
+			$tmpReport = ("`n{0}:`n{1}" -f $_, $job.Jobstateinfo.State)
+		}		
+		$job | Remove-Job -Force
+		$report += $tmpReport
+		Write-Verbose $tmpReport
+	}	
+	
+	$watch.Stop()	
+	$report += ("`nCompleted {0} jobs in {1} seconds." -f $Servers.Count, $watch.Elapsed.TotalSeconds )
+	return $report
+}
+
+function Remove-SPFeatureFromContentDB {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)]
+		[ValidateNotNullOrEmpty()]
+		[string] $ContentDb,
+		[Parameter(Mandatory = $true)]
+		[ValidateNotNullOrEmpty()]
+		[string] $FeatureId,
+		[Parameter(Mandatory = $false)]
+		[switch] $ReportOnly
+	)
+	SPLogMe
+	
+    $db = Get-SPDatabase | where { $_.Name -eq $ContentDb }
+    [bool]$report = $false
+    if ($ReportOnly) { $report = $true }
+    
+    $db.Sites | ForEach-Object {
+        
+        Remove-SPFeature -obj $_ -ObjectName "site collection" -FeatureId $FeatureId -Report $report
+                
+        $_ | Get-SPWeb -Limit all | ForEach-Object {
+            
+            Remove-SPFeature -obj $_ -ObjectName "site" -FeatureId $FeatureId -Report $report
+        }
+    }
+}
+
+function Remove-SPFeature {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)]
+		[ValidateNotNullOrEmpty()]
+		$SPObject,
+		[Parameter(Mandatory = $true)]
+		[ValidateNotNullOrEmpty()]
+		[string] $ObjectName,
+		[Parameter(Mandatory = $true)]
+		[ValidateNotNullOrEmpty()]
+		[string] $FeatureId,
+		[Parameter(Mandatory = $false)]
+		[bool] $Report = $false
+	)
+	SPLogMe
+	
+    $feature = $SPObject.Features[$FeatureId]
+    
+    if ($feature -ne $null) {
+        if ($report) {
+            write-host "Feature found in" $ObjectName ":" $SPObject.Url -foregroundcolor Red
+        }
+        else {
+            try {
+                $SPObject.Features.Remove($feature.DefinitionId, $true)
+                write-host "Feature successfully removed from" $ObjectName ":" $SPObject.Url -foregroundcolor Red
+            }
+            catch {
+                write-host "There has been an error trying to remove the feature:" $_
+            }
+        }
+    }
+    else {
+        write-host "Feature ID specified does not exist in" $ObjectName ":" $SPObject.Url
+    }
+}
+
 #region Function Exports
+Export-ModuleMember -Function Remove-SPFeatureFromContentDB
+Export-ModuleMember -Function Remove-SPFeature
 Export-ModuleMember -Function Add-SharepointShellAdmin 
+Export-ModuleMember -Function Remove-SharepointShellAdmin 
 Export-ModuleMember -Function Enable-SPDeveloperDashboard 
 Export-ModuleMember -Function Disable-SPDeveloperDashboard 
 Export-ModuleMember -Function Switch-SPDeveloperDashboard 
@@ -2794,7 +3540,7 @@ Export-ModuleMember -Function Stop-SPWindowsServices
 Export-ModuleMember -Function Upgrade-SPContentDB 
 Export-ModuleMember -Function Copy-SPList
 Export-ModuleMember -Function Reset-AllSPIIS 
-Export-ModuleMember -Function DoParallel-OnSPServers
+Export-ModuleMember -Function Do-ParallelOnSPServers
 Export-ModuleMember -Function SPLogMe 
 Export-ModuleMember -Function Get-SPProductInformation
 Export-ModuleMember -Function Start-AuditReportInterface
@@ -2842,4 +3588,11 @@ Export-ModuleMember -Function Clear-SPPeoplePickerADProvider
 Export-ModuleMember -Function Remove-SPPeoplePickerADProvider
 Export-ModuleMember -Function Get-SPSiteMetrics
 Export-ModuleMember -Function Get-SPSitesSize
+Export-ModuleMember -Function Enable-CredSSPonSPServersAsClient
+Export-ModuleMember -Function Enable-CredSSPonSPServersAsServer
+Export-ModuleMember -Function Clear-SPConfigCache
+Export-ModuleMember -Function Install-SPPatch
+Export-ModuleMember -Function Invoke-SPConfigWizard
+Export-ModuleMember -Function Do-SequentialOnSPServers
+Export-ModuleMember -Function Get-SPDistributedCacheServers
 #endregion
